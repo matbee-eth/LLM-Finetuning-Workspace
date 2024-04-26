@@ -1,0 +1,1 @@
+accelerate launch idefics-ds.py --ignore_mismatched_sizes
