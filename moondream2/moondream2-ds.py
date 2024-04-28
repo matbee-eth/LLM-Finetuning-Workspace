@@ -42,12 +42,6 @@ class ModelArguments:
             "help": "Path to pretrained model or model identifier from huggingface.co/models"
         }
     )
-    chat_template_format: Optional[str] = field(
-        default="none",
-        metadata={
-            "help": "chatml|zephyr|none. Pass `none` if the dataset is already formatted with the chat template."
-        },
-    )
     lora_alpha: Optional[int] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.1)
     lora_r: Optional[int] = field(default=64)
@@ -234,7 +228,7 @@ def compute_loss(batch, moondream, accelerator):
 def main(model_args, data_args, training_args):
     accelerator = Accelerator()
     processor = AutoProcessor.from_pretrained(
-        "vikhyatk/moondream2",
+        model_args.model_name_or_path,
         do_image_splitting=True,
         trust_remote_code=True,
         revision=MD_REVISION

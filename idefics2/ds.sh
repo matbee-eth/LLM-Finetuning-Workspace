@@ -1,0 +1,1 @@
+torchrun idefics-ds.py --output_dir ./test
