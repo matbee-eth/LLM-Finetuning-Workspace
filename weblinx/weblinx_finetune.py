@@ -1,11 +1,19 @@
 import datasets
 import lxml.html
 import json
+import weblinx.utils.format as wlf
+import pyarrow.parquet as pq
+import pyarrow as pa
+import pandas as pd
+import logging
+from io import BytesIO
 from PIL import Image
 from functools import partial
 from typing import Callable
 from pathlib import Path
+from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments, AutoProcessor, BitsAndBytesConfig, AutoModelForCausalLM, TrainingArguments, Trainer
 from weblinx import Demonstration, filter_turns, Replay
+from weblinx.utils import load_demo_names_in_split
 from weblinx.processing.dom import clean_and_prune_tree
 from weblinx.processing import load_candidate_elements
 from weblinx.processing.prompt import (
@@ -18,12 +26,22 @@ from weblinx.processing.prompt import (
     get_speaker,
     multi_attempt_format_prev_turns_truncated,
 )
-from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments, AutoProcessor, BitsAndBytesConfig, AutoModelForCausalLM, TrainingArguments, Trainer
 from weblinx.processing.truncation import (
     multi_attempt_truncate_cands_turn,
     multi_attempt_truncate_dom_tree,
 )
-import weblinx.utils.format as wlf
+
+logging.getLogger("PIL.PngImagePlugin").setLevel(logging.CRITICAL + 1)
+
+def read_image_bytes(file_path):
+    with open(file_path, 'rb') as f:
+        return f.read()
+
+schema = pa.schema([
+    ('text', pa.string()),
+    ('image', pa.binary())  # Change to binary to store image bytes
+])
+
 def build_formatter_for_multichoice():
     format_click = partial(wlf.format_click, formatters=(wlf.format_uid,))
     format_text_input = partial(
@@ -269,7 +287,6 @@ def build_prompt_records_for_llama_truncated(
 
     return [{"role": "system", "content": [{"type": "text", "text": sys_prompt}]}, *prev_turns_merged]
 
-
 def __insert_empty_user_content_at_first(prompt: list):
     """
     Given a list of dictionary representing the input prompt, insert an empty user content at the first position
@@ -303,65 +320,83 @@ def insert_formatted_chat_into_records(
                 "type": "text",
                 "text": record["output_target"]
             }]}]
-            combined
         else:
             combined = record[origin_key]
-
-        text = processor.apply_chat_template(
-            combined, tokenize=False, add_generation_prompt=False
-        )
-        records[i][text_key] = text
-from PIL import Image
+        
+        try:
+            text = processor.apply_chat_template(
+                combined, tokenize=False, add_generation_prompt=False
+            )
+            records[i][text_key] = text
+        except Exception as e:
+            print(f"Error occurred: {e}, {combined}",)
+            raise Exception(f"Error occurred while processing record: {record}. Error: {e}")
 
 def main(processor, tokenizer):
-    wl_dir = Path("/media/acidhax/data/datasets/webLINX-full/")
-    base_dir = wl_dir / "demonstrations"
-    split_path = wl_dir / "splits.json"
-    candidates_path = wl_dir / "candidates/train.jsonl"
+    writer = pq.ParquetWriter('./training.parquet', schema, flavor='spark')
+    validation_writer = pq.ParquetWriter('./validation.parquet', schema, flavor='spark')
+    wl_dir = "/media/acidhax/data/datasets/webLINX-full/"
+    data_dir = Path(f"{wl_dir}")
+    base_dir = wl_dir + "/demonstrations"
+    candidates_path = wl_dir + "/candidates/{}.jsonl"
+    split_path = data_dir / "splits.json"
 
-    # Load the name of the demonstrations in the training split
-    demo_names = ['aaabtsd', 'frvoxei', 'iuealcb', "apcwqgp", "bhcfixm", "cihwsqb", "dgcfhzx", "dwilaqa", "ejswgyk", "fcalwwv", "ftfmtwv", "gmlesoh", "hhzcqzv", "hzrykcf", "iwtxybo", "jptsssp", "kimiuov", "ldasoxo", "lyjvevw", "mrysrpr", "nrfopnt", "ooyygpw", "plvhjif", "qgtzogg", "rbkfraa", "rtjqoxa"]
-    
-    demos = [Demonstration(name, base_dir=base_dir) for name in demo_names]
-    candidates = load_candidate_elements(candidates_path, group_keys=('demo_name', 'turn_index'), log_fn=None)
+    train_candidates = load_candidate_elements(candidates_path.format("train"), group_keys=('demo_name', 'turn_index'), log_fn=None)
+    validation_candidates = load_candidate_elements(candidates_path.format("valid"), group_keys=('demo_name', 'turn_index'), log_fn=None)
+
+    train_demo_names = load_demo_names_in_split(split_path, split='train')
+    validation_demo_names = load_demo_names_in_split(split_path, split='valid')
+    training = [Demonstration(name, base_dir=base_dir) for name in train_demo_names]
+    validation = [Demonstration(name, base_dir=base_dir) for name in validation_demo_names]
 
     format_intent = build_formatter_for_multichoice()
 
-    selected_turns = select_turns_and_candidates_for_prompts(
-        demos=demos,
-        candidates=candidates,
-        num_candidates=10,
-    )
-    
-    # Build input records for training the model
-    input_records = build_input_records_from_selected_turns(
-        selected_turns=selected_turns,
-        format_intent=format_intent,
-        build_prompt_records_fn=partial(
-            build_prompt_records_for_llama_truncated,
-            format_intent=format_intent,
-            tokenizer=processor.tokenizer,
-            include_images=True,
-            processor=processor,
-        ),
-        format_prompt_records_fn=None
-    )
+    # Must do this chunking solely for memory management.
+    def parseDemo(demo, candidates, writer):
+        print("demo", demo)
+        selected_turns = select_turns_and_candidates_for_prompts(
+            demos=[demo],
+            candidates=candidates,
+            num_candidates=10,
+        )
 
-    insert_formatted_chat_into_records(
-        input_records, processor, include_output_target=True
-    )
-    def loadImage(item):
-        print("loadImage", item["image"])
-        item["image"] = [Image.open(item["image"][0])]
-        return item
-    input_records_texts = [{"text": record["text"], "image": record["screenshot_path"]} for record in input_records]
-    input_records_fname = "input_records_trunc.json"
-    with open(input_records_fname, "w") as f:
-        json.dump(input_records_texts, f, indent=2)
-    dataset = datasets.Dataset.from_list(input_records_texts)
-    dataset.set_transform(loadImage)
-    
-class MyDataCollator:
+        # Build input records for training the model
+        input_records = build_input_records_from_selected_turns(
+            selected_turns=selected_turns,
+            format_intent=format_intent,
+            build_prompt_records_fn=partial(
+                build_prompt_records_for_llama_truncated,
+                format_intent=format_intent,
+                tokenizer=tokenizer,
+                include_images=True,
+                processor=processor,
+            ),
+            format_prompt_records_fn=None
+        )
+
+        insert_formatted_chat_into_records(
+            input_records, processor, include_output_target=True
+        )
+
+        try:
+            input_records_texts = [
+                {
+                    "text": record["text"],
+                    "image": read_image_bytes(record["screenshot_path"])
+                } for record in input_records
+            ]
+            table = pa.Table.from_pandas(pd.DataFrame(input_records_texts), schema=schema)
+            writer.write_table(table)
+        except Exception:
+            pass
+
+        # Clear the list to free up memory
+        input_records.clear()
+
+    [parseDemo(demo, train_candidates, writer) for demo in training]
+    [parseDemo(demo, validation_candidates, validation_writer) for demo in validation]
+
+class WeblinxMultimodalDataCollator:
     def __init__(self, processor):
         self.processor = processor
         self.image_token_id = self.processor.tokenizer.additional_special_tokens_ids[
@@ -372,7 +407,7 @@ class MyDataCollator:
         texts = []
         images = []
         for example in examples:
-            image = example["image"]
+            image = Image.open(BytesIO(example["image"]))
             text = example["text"]
             if image is None:
                 continue
@@ -393,16 +428,8 @@ if __name__ == "__main__":
         "HuggingFaceM4/idefics2-8b",
         do_image_splitting=True,
         trust_remote_code=True,
-        revision=MD_REVISION
     )
-    # print(processor.apply_chat_template(test, tokenize=False))
-    tokenizer = AutoTokenizer.from_pretrained(
-        "HuggingFaceM4/idefics2-8b",
-        do_image_splitting=True,
-        trust_remote_code=True,
-        use_fast=True
-     )
-    tokenizer.pad_token = tokenizer.eos_token
+    processor.tokenizer.pad_token = processor.tokenizer.eos_token
     # tokenizer.chat_template = IDEFICS2_CHAT_TEMPLATE
 
-    main(processor, tokenizer)
+    main(processor, processor.tokenizer)

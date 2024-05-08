@@ -2,19 +2,22 @@
     "zero_optimization": {
         "stage": 3,
         "offload_param": {
-            "device": "none"
+            "device": "cpu"
         },
         "offload_optimizer": {
             "device": "none"
-        }
+        },
+        "stage3_gather_16bit_weights_on_model_save": true
     },
     "fp16": {
-        "enabled": "auto"
+        "enabled": false
     },
     "bf16": {
-        "enabled": "auto"
+        "enabled": true
     },
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",
-    "gradient_accumulation_steps": "auto"
+    "gradient_accumulation_steps": 1,
+    "num_machines": 1,
+    "num_processes": 2
 }
